@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <stdbool.h>
 #include "tracer.h"
 
 static void usage(const char *prog)
@@ -81,17 +82,53 @@ static int parse_args(int argc, char **argv, tracer_config_t *cfg)
 }
 
 
-static int run_until_exit(pid_t pid)
+/* Set by the signal handler in attach mode so we can detach cleanly. */
+static volatile sig_atomic_t g_stop = 0;
+
+static void on_stop_signal(int sig)
+{
+    (void)sig;
+    g_stop = 1;
+}
+
+static void install_stop_handlers(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;            /* no SA_RESTART: waitpid must return EINTR */
+
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
+
+static int run_until_exit(pid_t pid, bool attached)
 {
     int status;
     int sig = 0;
+    bool resume = true;
 
     for (;;) {
-        if (ptrace(PTRACE_CONT, pid, 0, (void *)(intptr_t)sig) == -1) {
+        if (resume && ptrace(PTRACE_CONT, pid, 0, (void *)(intptr_t)sig) == -1) {
             perror("ptrace(PTRACE_CONT)");
             return EXIT_FAILURE;
         }
-        if (waitpid(pid, &status, 0) == -1) {
+        resume = true;
+        sig = 0;
+
+        if (waitpid(pid, &status, __WALL) == -1) {
+            if (errno == EINTR) {
+                if (attached && g_stop) {
+                    if (tracer_detach(pid) == 0)
+                        fprintf(stderr, "+++ detached from pid %d +++\n", pid);
+                    return EXIT_SUCCESS;
+                }
+                resume = false;     /* tracee still running: just wait again */
+                continue;
+            }
             perror("waitpid");
             return EXIT_FAILURE;
         }
@@ -106,6 +143,7 @@ static int run_until_exit(pid_t pid)
         }
         if (WIFSTOPPED(status)) {
             sig = WSTOPSIG(status);
+            /* SIGTRAP after execve is ours; everything else is forwarded. */
             if (sig == SIGTRAP)
                 sig = 0;
         }
@@ -115,6 +153,8 @@ static int run_until_exit(pid_t pid)
 int main(int argc, char **argv)
 {
     tracer_config_t cfg;
+    pid_t pid;
+    bool attached = false;
 
     if (parse_args(argc, argv, &cfg) < 0) {
         usage(argv[0]);
@@ -122,14 +162,17 @@ int main(int argc, char **argv)
     }
 
     if (cfg.attach_pid) {
-        fprintf(stderr, "%s: attach mode not implemented yet (Step 3)\n",
-                argv[0]);
-        return EXIT_FAILURE;
+        pid = cfg.attach_pid;
+        install_stop_handlers();
+        if (tracer_attach(pid) < 0)
+            return EXIT_FAILURE;
+        attached = true;
+        fprintf(stderr, "+++ attached to pid %d +++\n", pid);
+    } else {
+        pid = tracer_spawn(cfg.cmd_argv);
+        if (pid < 0)
+            return EXIT_FAILURE;
     }
 
-    pid_t pid = tracer_spawn(cfg.cmd_argv);
-    if (pid < 0)
-        return EXIT_FAILURE;
-
-    return run_until_exit(pid);
+    return run_until_exit(pid, attached);
 }

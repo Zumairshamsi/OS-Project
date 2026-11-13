@@ -14,9 +14,10 @@ typedef struct {
 } tracer_config_t;
 
 /* ---- Process control layer (src/control.c) ---- */
-int tracer_set_options(pid_t pid);
-
-
+int tracer_set_options(pid_t pid, bool exit_kill);
 pid_t tracer_spawn(char *const argv[]);
+
+int tracer_attach(pid_t pid);
+int tracer_detach(pid_t pid);
 
 #endif /* TRACER_H */

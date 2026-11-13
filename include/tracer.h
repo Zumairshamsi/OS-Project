@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 
+
 typedef struct {
     pid_t       attach_pid;   /* -p PID; 0 means spawn mode            */
     char      **cmd_argv;     /* command + args; NULL means attach mode */
@@ -12,4 +13,10 @@ typedef struct {
     const char *filter_str;   /* -e trace=...  (text after "trace=")    */
 } tracer_config_t;
 
-#endif
+/* ---- Process control layer (src/control.c) ---- */
+int tracer_set_options(pid_t pid);
+
+
+pid_t tracer_spawn(char *const argv[]);
+
+#endif /* TRACER_H */

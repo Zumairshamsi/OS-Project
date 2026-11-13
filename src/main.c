@@ -1,10 +1,12 @@
-#define _GNU_SOURCE
 #include <errno.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <signal.h>
+#include <stdint.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
 #include "tracer.h"
 
 static void usage(const char *prog)
@@ -78,6 +80,38 @@ static int parse_args(int argc, char **argv, tracer_config_t *cfg)
     return 0;
 }
 
+
+static int run_until_exit(pid_t pid)
+{
+    int status;
+    int sig = 0;
+
+    for (;;) {
+        if (ptrace(PTRACE_CONT, pid, 0, (void *)(intptr_t)sig) == -1) {
+            perror("ptrace(PTRACE_CONT)");
+            return EXIT_FAILURE;
+        }
+        if (waitpid(pid, &status, 0) == -1) {
+            perror("waitpid");
+            return EXIT_FAILURE;
+        }
+
+        if (WIFEXITED(status)) {
+            fprintf(stderr, "+++ exited with %d +++\n", WEXITSTATUS(status));
+            return WEXITSTATUS(status);
+        }
+        if (WIFSIGNALED(status)) {
+            fprintf(stderr, "+++ killed by signal %d +++\n", WTERMSIG(status));
+            return 128 + WTERMSIG(status);
+        }
+        if (WIFSTOPPED(status)) {
+            sig = WSTOPSIG(status);
+            if (sig == SIGTRAP)
+                sig = 0;
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     tracer_config_t cfg;
@@ -87,15 +121,15 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /* Temporary: just shows what we parsed. Replaced in Step 2. */
-    printf("mode    : %s\n", cfg.attach_pid ? "attach" : "spawn");
-    if (cfg.attach_pid)
-        printf("pid     : %d\n", cfg.attach_pid);
-    else
-        printf("command : %s\n", cfg.cmd_argv[0]);
-    printf("filter  : %s\n", cfg.filter_str ? cfg.filter_str : "(none)");
-    printf("summary : %s\n", cfg.summary ? "yes" : "no");
-    printf("output  : %s\n", cfg.out_path ? cfg.out_path : "stderr");
+    if (cfg.attach_pid) {
+        fprintf(stderr, "%s: attach mode not implemented yet (Step 3)\n",
+                argv[0]);
+        return EXIT_FAILURE;
+    }
 
-    return EXIT_SUCCESS;
+    pid_t pid = tracer_spawn(cfg.cmd_argv);
+    if (pid < 0)
+        return EXIT_FAILURE;
+
+    return run_until_exit(pid);
 }

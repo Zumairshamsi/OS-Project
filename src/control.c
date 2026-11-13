@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -7,7 +7,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
+#include <string.h>
 #include "tracer.h"
 
 int tracer_set_options(pid_t pid)

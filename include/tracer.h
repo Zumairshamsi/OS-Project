@@ -20,4 +20,15 @@ pid_t tracer_spawn(char *const argv[]);
 int tracer_attach(pid_t pid);
 int tracer_detach(pid_t pid);
 
+/* ---- Interception layer (src/trace.c) ---- */
+
+/* Install SIGINT/SIGTERM handlers (no SA_RESTART) used to detach cleanly.
+ * Call BEFORE tracer_attach() in attach mode. */
+void tracer_install_stop_handlers(void);
+
+/* Main interception loop. Runs until the tracee exits, is killed, or
+ * (attach mode) the user presses Ctrl+C.
+ * Returns the exit code the tracer should use. */
+int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg);
+
 #endif /* TRACER_H */

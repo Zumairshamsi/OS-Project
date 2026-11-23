@@ -129,7 +129,7 @@ int tracer_detach(pid_t pid)
         if (sig == SIGSTOP)
             break;
 
-        if (sig == SIGTRAP)
+        if (sig == SIGTRAP || sig == (SIGTRAP | 0x80))
             sig = 0;
         ptrace(PTRACE_CONT, pid, 0, (void *)(intptr_t)sig);
     }

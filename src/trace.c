@@ -110,12 +110,7 @@ static void print_syscall(const syscall_rec_t *r, bool have_args, bool returned)
         fprintf(stderr, "syscall_%ld", r->nr);
 
     fputc('(', stderr);
-    if (have_args) {
-        for (int i = 0; i < 6; i++)
-            fprintf(stderr, "%s0x%lx", i ? ", " : "", r->args[i]);
-    } else {
-        fputs("?", stderr);
-    }
+    fputs(have_args ? r->argstr : "?", stderr);
     fputc(')', stderr);
 
     if (!returned) {
@@ -126,6 +121,8 @@ static void print_syscall(const syscall_rec_t *r, bool have_args, bool returned)
             fprintf(stderr, " = -1 %s (%s)\n", en, strerror(r->err));
         else
             fprintf(stderr, " = -1 errno %d (%s)\n", r->err, strerror(r->err));
+    } else if (decode_ret_is_pointer(r->nr)) {
+        fprintf(stderr, " = 0x%lx\n", (unsigned long)r->ret);
     } else {
         fprintf(stderr, " = %ld\n", r->ret);
     }
@@ -152,6 +149,7 @@ static void handle_syscall_stop(tracee_t *t)
     if (!t->in_syscall) {
         /* ---- ENTRY ---- */
         fill_entry(&t->cur, &regs);
+        decode_args(t->pid, &t->cur, false);    /* paths, input buffers */
         t->have_entry = true;
         t->in_syscall = true;
         t->entries++;
@@ -160,17 +158,20 @@ static void handle_syscall_stop(tracee_t *t)
             print_syscall(&t->cur, true, false);
     } else {
         /* ---- EXIT ---- */
-        syscall_rec_t r;
+        syscall_rec_t *r = &t->cur;
 
-        if (t->have_entry) {
-            r = t->cur;
-        } else {
+        if (!t->have_entry) {
             /* Attached mid-syscall: we never saw the arguments. */
-            memset(&r, 0, sizeof(r));
-            r.nr = (long)regs.orig_rax;
+            memset(r, 0, sizeof(*r));
+            r->nr = (long)regs.orig_rax;
         }
-        fill_exit(&r, &regs);
-        print_syscall(&r, t->have_entry, true);
+        fill_exit(r, &regs);
+
+        /* Output buffers (read, readlink...) are only valid now. */
+        if (t->have_entry && decode_has_output_buf(r->nr))
+            decode_args(t->pid, r, true);
+
+        print_syscall(r, t->have_entry, true);
 
         t->have_entry = false;
         t->in_syscall = false;
@@ -195,7 +196,7 @@ int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
 
     (void)cfg;                  /* used from Step 7 onwards */
     syscalls_init();
-    
+
     for (;;) {
         if (resume &&
             ptrace(PTRACE_SYSCALL, t.pid, 0, (void *)(intptr_t)sig) == -1) {

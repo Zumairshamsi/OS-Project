@@ -13,6 +13,16 @@ typedef struct {
     const char *filter_str;   /* -e trace=...  (text after "trace=")    */
 } tracer_config_t;
 
+/* One decoded system call: filled at entry (nr, args), completed at exit
+ * (ret, failed, err). Reused by the name table, decoder and statistics. */
+typedef struct {
+    long          nr;          /* syscall number (orig_rax)              */
+    unsigned long args[6];     /* rdi, rsi, rdx, r10, r8, r9             */
+    long          ret;         /* rax at exit                            */
+    bool          failed;      /* ret in [-4095, -1]                     */
+    int           err;         /* errno value when failed, else 0        */
+} syscall_rec_t;
+
 /* ---- Process control layer (src/control.c) ---- */
 int tracer_set_options(pid_t pid, bool exit_kill);
 pid_t tracer_spawn(char *const argv[]);

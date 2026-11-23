@@ -41,4 +41,18 @@ void tracer_install_stop_handlers(void);
  * Returns the exit code the tracer should use. */
 int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg);
 
+/* ---- Name resolution (src/syscalls.c) ---- */
+
+/* Build the syscall hash map. Idempotent; lookups call it lazily too. */
+void        syscalls_init(void);
+
+/* x86_64 syscall number -> name, or NULL if unknown. */
+const char *syscall_name(long nr);
+
+/* Name -> syscall number, or -1 if unknown. (Used by -e in Step 10.) */
+long        syscall_number(const char *name);
+
+/* errno value -> "ENOENT" etc., or NULL if unknown. */
+const char *errno_name(int err);
+
 #endif /* TRACER_H */

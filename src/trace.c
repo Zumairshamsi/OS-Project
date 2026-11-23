@@ -102,7 +102,14 @@ static bool never_returns(long nr)
 
 static void print_syscall(const syscall_rec_t *r, bool have_args, bool returned)
 {
-    fprintf(stderr, "syscall_%ld(", r->nr);
+    const char *name = syscall_name(r->nr);
+
+    if (name)
+        fputs(name, stderr);
+    else
+        fprintf(stderr, "syscall_%ld", r->nr);
+
+    fputc('(', stderr);
     if (have_args) {
         for (int i = 0; i < 6; i++)
             fprintf(stderr, "%s0x%lx", i ? ", " : "", r->args[i]);
@@ -111,12 +118,17 @@ static void print_syscall(const syscall_rec_t *r, bool have_args, bool returned)
     }
     fputc(')', stderr);
 
-    if (!returned)
+    if (!returned) {
         fputs(" = ?\n", stderr);
-    else if (r->failed)
-        fprintf(stderr, " = -1 errno=%d (%s)\n", r->err, strerror(r->err));
-    else
+    } else if (r->failed) {
+        const char *en = errno_name(r->err);
+        if (en)
+            fprintf(stderr, " = -1 %s (%s)\n", en, strerror(r->err));
+        else
+            fprintf(stderr, " = -1 errno %d (%s)\n", r->err, strerror(r->err));
+    } else {
         fprintf(stderr, " = %ld\n", r->ret);
+    }
 }
 
 /* ---------- one syscall stop ---------- */
@@ -182,7 +194,8 @@ int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
     bool resume = true;
 
     (void)cfg;                  /* used from Step 7 onwards */
-
+    syscalls_init();
+    
     for (;;) {
         if (resume &&
             ptrace(PTRACE_SYSCALL, t.pid, 0, (void *)(intptr_t)sig) == -1) {

@@ -31,4 +31,13 @@ clean:
 	rm -rf build $(TARGET)
 
 .DELETE_ON_ERROR:
-.PHONY: all asan clean
+test: all
+	bash tests/run_tests.sh
+
+bench: all
+	bash tests/bench.sh
+
+samples: all
+	bash tests/samples.sh
+
+.PHONY: all asan clean test bench samples

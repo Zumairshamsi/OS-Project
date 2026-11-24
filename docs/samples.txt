@@ -1,0 +1,96 @@
+mini_strace samples, 2026-11-24T11:40:15Z, Linux 6.18.44-fc-v819 x86_64
+
+##### 1. Basic trace
+$ mini_strace cat data.txt
+
+[  0.001914] openat(AT_FDCWD, "/tmp/tmp.crN3kP7YDA/data.txt", O_RDONLY) = 3 <0.000003>
+[  0.001929] fstat(3, 0x7ffeffed9300) = 0 <0.000004>
+[  0.001952] fadvise64(0x3, 0x0, 0x0, 0x2, 0x0, 0x0) = 0 <0.000003>
+[  0.001965] mmap(NULL, 139264, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0x0) = 0x7f7e31e93000 <0.000003>
+[  0.001984] read(3, "hello-mini-strace\n", 131072) = 18 <0.000009>
+hello-mini-strace
+[  0.002019] write(1, "hello-mini-strace\n", 18) = 18 <0.000005>
+[  0.002040] read(3, "", 131072) = 0 <0.000002>
+[  0.002056] munmap(0x7f7e31e93000, 139264) = 0 <0.000009>
+[  0.002084] close(3) = 0 <0.000002>
+[  0.002097] close(1) = 0 <0.000004>
+[  0.002118] close(2) = 0 <0.000001>
+[  0.002130] exit_group(0) = ?
+[  0.002186] +++ exited with 0 +++
+(entries=51 exits=50 resyncs=0 tracees=1)
+
+##### 2. Filter
+$ mini_strace -e trace=openat,read,write,close cat data.txt
+
+[  0.000922] read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\220\243\2\0\0\0\0\0"..., 832) = 832 <0.000003>
+[  0.001009] close(3) = 0 <0.000001>
+[  0.001212] openat(AT_FDCWD, "/tmp/tmp.crN3kP7YDA/data.txt", O_RDONLY) = 3 <0.000003>
+[  0.001240] read(3, "hello-mini-strace\n", 131072) = 18 <0.000003>
+hello-mini-strace
+[  0.001263] write(1, "hello-mini-strace\n", 18) = 18 <0.000002>
+[  0.001281] read(3, "", 131072) = 0 <0.000001>
+[  0.001310] close(3) = 0 <0.000001>
+[  0.001329] close(1) = 0 <0.000001>
+[  0.001346] close(2) = 0 <0.000001>
+[  0.001410] +++ exited with 0 +++
+(entries=51 exits=50 resyncs=0 tracees=1)
+
+##### 3. ENOENT
+$ mini_strace -e trace=openat cat /nonexistent
+
+[  0.001149] openat(AT_FDCWD, "/nonexistent", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000002>
+cat: /nonexistent: No such file or directory
+[  0.001341] +++ exited with 1 +++
+(entries=47 exits=46 resyncs=0 tracees=1)
+
+##### 4. Statistics
+$ mini_strace -c ls /usr/include
+
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 45.17    0.000218          31         7         6 execve
+ 10.95    0.000053           3        17           mmap
+ 10.41    0.000050          25         2           getdents64
+  4.69    0.000023           2         8           close
+  4.54    0.000022           4         5           read
+  4.22    0.000020           3         6           openat
+  4.19    0.000020           4         5           mprotect
+  3.53    0.000017           2         7           fstat
+  2.13    0.000010           5         2         2 statfs
+  1.80    0.000009           8         1           munmap
+  1.57    0.000008           3         2         2 access
+  1.35    0.000007           2         3           brk
+  0.97    0.000005           2         2         2 ioctl
+  0.76    0.000004           1         2           pread64
+  0.71    0.000003           3         1           statx
+  0.54    0.000003           2         1           write
+  0.46    0.000002           2         1           getrandom
+  0.44    0.000002           2         1           prlimit64
+
+##### 5. Children
+$ mini_strace -e trace=execve sh -c '/bin/true; /bin/echo hi'
+
+[  0.003351] [pid 1152] +++ exited with 0 +++
+[  0.003381] [pid 1151] --- SIGCHLD {si_pid=1152, si_status=0} ---
+[  0.003478] [pid 1153] execve("/bin/echo", ["/bin/echo", "hi"], 0x56225e4a89b8 /* 29 vars */) = 0 <0.000078>
+hi
+[  0.004662] [pid 1153] +++ exited with 0 +++
+[  0.004680] [pid 1151] --- SIGCHLD {si_pid=1153, si_status=0} ---
+[  0.004774] [pid 1151] +++ exited with 0 +++
+(entries=136 exits=133 resyncs=0 tracees=3)
+
+##### 6. Fatal signal
+$ mini_strace ./segv
+
+[  0.001382] munmap(0x7f16554b3000, 49732) = 0 <0.000007>
+[  0.001414] --- SIGSEGV {si_code=SEGV_MAPERR, si_addr=(nil)} ---
+[  0.001459] +++ killed by SIGSEGV +++
+(entries=29 exits=29 resyncs=0 tracees=1)
+
+##### 7. -o redirection
+$ mini_strace -o trace.log echo hi; head -3 trace.log
+
+hi
+[  0.000086] execve("/home/claude/.npm-global/bin/echo", ["echo", "hi"], 0x7ffc4bf71db8 /* 29 vars */) = -1 ENOENT (No such file or directory) <0.000007>
+[  0.000162] execve("/home/claude/.local/bin/echo", ["echo", "hi"], 0x7ffc4bf71db8 /* 29 vars */) = -1 ENOENT (No such file or directory) <0.000003>
+[  0.000181] execve("/root/.local/bin/echo", ["echo", "hi"], 0x7ffc4bf71db8 /* 29 vars */) = -1 ENOENT (No such file or directory) <0.000003>

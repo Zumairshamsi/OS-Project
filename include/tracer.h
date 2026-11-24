@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /* Which syscalls to show: a bitmask indexed by syscall number. */
 #define FILTER_MAX_NR 1024
@@ -21,6 +22,7 @@ typedef struct {
     const char *out_path;     /* -o FILE; NULL means stderr             */
     const char *filter_str;   /* -e trace=...  (text after "trace=")    */
     syscall_filter_t filter;  /* parsed from filter_str by filter_parse()  */
+    FILE            *out;     /* trace destination (stderr unless -o)      */
 } tracer_config_t;
 
 #define ARGSTR_MAX 2048
@@ -101,5 +103,22 @@ int  filter_parse(const char *list, syscall_filter_t *f);
 
 /* True if syscall nr should be shown. Always true for an inactive filter. */
 bool filter_allows(const syscall_filter_t *f, long nr);
+
+/* ---- Statistics (src/stats.c) ---- */
+
+typedef struct {
+    unsigned long calls;
+    unsigned long errors;
+    int64_t       total_ns;
+} stat_entry_t;
+
+typedef struct {
+    stat_entry_t e[FILTER_MAX_NR];      /* indexed by syscall number */
+} stats_t;
+
+stats_t *stats_create(void);
+void     stats_destroy(stats_t *st);
+void     stats_record(stats_t *st, const syscall_rec_t *r);
+void     stats_print(FILE *out, const stats_t *st);
 
 #endif /* TRACER_H */

@@ -52,6 +52,9 @@ typedef struct {
     int           root_code;            /* exit code to return               */
     int           sfd;                  /* signalfd                          */
     const syscall_filter_t *filter;     /* from the command line             */
+    FILE         *out;                  /* trace destination                 */
+    bool          quiet;                /* -c: no per-event lines            */
+    stats_t      *stats;                /* NULL unless -c                    */
     int64_t       t0_ns;                /* CLOCK_MONOTONIC at tracer start   */
     int           interrupt_sig;        /* SIGINT/SIGTERM seen, else 0       */
     unsigned long entries, exits, resyncs;   /* totals of finished tracees   */
@@ -116,7 +119,7 @@ static void put_stamp(const session_t *s, int64_t ns)
 
     if (rel < 0)
         rel = 0;
-    fprintf(stderr, "[%3lld.%06lld] ",
+    fprintf(s->out, "[%3lld.%06lld] ",
             (long long)(rel / 1000000000LL),
             (long long)((rel % 1000000000LL) / 1000));
 }
@@ -126,7 +129,7 @@ static void prefix_at(const session_t *s, const tracee_t *t, int64_t ns)
 {
     put_stamp(s, ns);
     if (s->ever > 1)
-        fprintf(stderr, "[pid %d] ", t->pid);
+        fprintf(s->out, "[pid %d] ", t->pid);
 }
 
 static void prefix(const session_t *s, const tracee_t *t)
@@ -160,12 +163,14 @@ static const char *signame(int sig, char *buf, size_t n)
 static bool is_stop_signal(int sig)
 {
     return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN ||
-           sig == SIGTTOU;prefix
+           sig == SIGTTOU;
 }
 
 /* Print a signal-delivery-stop in strace style. */
 static void report_signal(const session_t *s, const tracee_t *t, int sig)
 {
+    if (s->quiet)
+        return;
     siginfo_t si;
     char nb[24];
     const char *nm = signame(sig, nb, sizeof nb);
@@ -173,7 +178,7 @@ static void report_signal(const session_t *s, const tracee_t *t, int sig)
     prefix(s, t);
 
     if (ptrace(PTRACE_GETSIGINFO, t->pid, 0, &si) == -1) {
-        fprintf(stderr, "--- %s ---\n", nm);
+        fprintf(s->out, "--- %s ---\n", nm);
         return;
     }
 
@@ -183,38 +188,40 @@ static void report_signal(const session_t *s, const tracee_t *t, int sig)
     case SIGILL:
     case SIGFPE:
         if (sig == SIGSEGV && si.si_code == SEGV_MAPERR)
-            fprintf(stderr, "--- %s {si_code=SEGV_MAPERR, si_addr=%p} ---\n",
+            fprintf(s->out, "--- %s {si_code=SEGV_MAPERR, si_addr=%p} ---\n",
                     nm, si.si_addr);
         else if (sig == SIGSEGV && si.si_code == SEGV_ACCERR)
-            fprintf(stderr, "--- %s {si_code=SEGV_ACCERR, si_addr=%p} ---\n",
+            fprintf(s->out, "--- %s {si_code=SEGV_ACCERR, si_addr=%p} ---\n",
                     nm, si.si_addr);
         else
-            fprintf(stderr, "--- %s {si_code=%d, si_addr=%p} ---\n",
+            fprintf(s->out, "--- %s {si_code=%d, si_addr=%p} ---\n",
                     nm, si.si_code, si.si_addr);
         break;
     case SIGCHLD:
-        fprintf(stderr, "--- %s {si_pid=%d, si_status=%d} ---\n",
+        fprintf(s->out, "--- %s {si_pid=%d, si_status=%d} ---\n",
                 nm, (int)si.si_pid, si.si_status);
         break;
     default:
         if (si.si_code <= 0)            /* kill(), sigqueue(), tkill()... */
-            fprintf(stderr, "--- %s {si_pid=%d, si_uid=%u} ---\n",
+            fprintf(s->out, "--- %s {si_pid=%d, si_uid=%u} ---\n",
                     nm, (int)si.si_pid, (unsigned)si.si_uid);
         else
-            fprintf(stderr, "--- %s ---\n", nm);
+            fprintf(s->out, "--- %s ---\n", nm);
         break;
     }
 }
 
 static void report_exit(const session_t *s, const tracee_t *t, int status)
 {
+    if (s->quiet)
+        return;
     prefix(s, t);
     if (WIFEXITED(status)) {
-        fprintf(stderr, "+++ exited with %d +++\n", WEXITSTATUS(status));
+        fprintf(s->out, "+++ exited with %d +++\n", WEXITSTATUS(status));
     } else {
         char nb[24];
 
-        fprintf(stderr, "+++ killed by %s%s +++\n",
+        fprintf(s->out, "+++ killed by %s%s +++\n",
                 signame(WTERMSIG(status), nb, sizeof nb),
                 WCOREDUMP(status) ? " (core dumped)" : "");
     }
@@ -265,7 +272,7 @@ static void drain_signals(session_t *s)
 }
 
 /* Wait for any tracee to change state.
- * Returns 1 with *pid/*status filled, 0 if the user interrupted us,
+ * Returns 1 with pid and status filled, 0 if the user interrupted us,
  * -1 on error (errno set; ECHILD means no tracees are left). */
 static int wait_any(session_t *s, int *status, pid_t *pid)
 {
@@ -346,40 +353,42 @@ static void print_syscall(const session_t *s, const tracee_t *t,
                           const syscall_rec_t *r, bool have_args,
                           bool returned)
 {
+    if (s->quiet)
+        return;
     const char *name = syscall_name(r->nr);
 
     /* Stamp = when the call began (unknown if we attached mid-call). */
     prefix_at(s, t, have_args ? r->start_ns : now_ns());
 
     if (name)
-        fputs(name, stderr);
+        fputs(name, s->out);
     else
-        fprintf(stderr, "syscall_%ld", r->nr);
+        fprintf(s->out, "syscall_%ld", r->nr);
 
-    fputc('(', stderr);
-    fputs(have_args ? r->argstr : "?", stderr);
-    fputc(')', stderr);
+    fputc('(', s->out);
+    fputs(have_args ? r->argstr : "?", s->out);
+    fputc(')', s->out);
 
     if (!returned) {
-        fputs(" = ?", stderr);
+        fputs(" = ?", s->out);
     } else if (r->failed) {
         const char *en = errno_name(r->err);
         if (en)
-            fprintf(stderr, " = -1 %s (%s)", en, strerror(r->err));
+            fprintf(s->out, " = -1 %s (%s)", en, strerror(r->err));
         else
-            fprintf(stderr, " = -1 errno %d (%s)", r->err, strerror(r->err));
+            fprintf(s->out, " = -1 errno %d (%s)", r->err, strerror(r->err));
     } else if (decode_ret_is_pointer(r->nr)) {
-        fprintf(stderr, " = 0x%lx", (unsigned long)r->ret);
+        fprintf(s->out, " = 0x%lx", (unsigned long)r->ret);
     } else {
-        fprintf(stderr, " = %ld", r->ret);
+        fprintf(s->out, " = %ld", r->ret);
     }
 
     if (returned && r->dur_ns >= 0)
-        fprintf(stderr, " <%lld.%06lld>",
+        fprintf(s->out, " <%lld.%06lld>",
                 (long long)(r->dur_ns / 1000000000LL),
                 (long long)((r->dur_ns % 1000000000LL) / 1000));
 
-    fputc('\n', stderr);
+    fputc('\n', s->out);
 }
 
 static void handle_syscall_stop(session_t *s, tracee_t *t, int64_t stop_ns)
@@ -401,7 +410,7 @@ static void handle_syscall_stop(session_t *s, tracee_t *t, int64_t stop_ns)
         /* ---- ENTRY ---- */
         fill_entry(&t->cur, &regs);
         t->cur_traced = filter_allows(s->filter, t->cur.nr);
-        if (t->cur_traced)                      /* skip the memory reads  */
+        if (t->cur_traced && !s->quiet)         /* skip the memory reads  */
             decode_args(t->pid, &t->cur, false);/* for filtered-out calls */
         t->cur.start_ns = now_ns();             /* after our decoding cost */
         t->cur.dur_ns   = -1;
@@ -425,10 +434,14 @@ static void handle_syscall_stop(session_t *s, tracee_t *t, int64_t stop_ns)
         r->dur_ns = t->have_entry ? stop_ns - r->start_ns : -1;
 
         if (t->cur_traced) {
-            /* Output buffers (read, readlink...) are only valid now. */
-            if (t->have_entry && decode_has_output_buf(r->nr))
-                decode_args(t->pid, r, true);
-            print_syscall(s, t, r, t->have_entry, true);
+            if (!s->quiet) {
+                /* Output buffers (read, readlink...) are only valid now. */
+                if (t->have_entry && decode_has_output_buf(r->nr))
+                    decode_args(t->pid, r, true);
+                print_syscall(s, t, r, t->have_entry, true);
+            }
+            if (s->stats)
+                stats_record(s->stats, r);
         }
 
         t->have_entry = false;
@@ -484,7 +497,8 @@ static int handle_signal_stop(session_t *s, tracee_t *t, int sig)
         char nb[24];
 
         prefix(s, t);
-        fprintf(stderr, "--- stopped by %s ---\n", signame(sig, nb, sizeof nb));
+        if (!s->quiet)
+            fprintf(s->out, "--- stopped by %s ---\n", signame(sig, nb, sizeof nb));
         return 0;
     }
 
@@ -519,11 +533,17 @@ int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
     syscalls_init();
     if (setup_signals(&s) == -1)
         return EXIT_FAILURE;
-
-    if (setup_signals(&s) == -1)
-        return EXIT_FAILURE;
     s.t0_ns = now_ns();
     s.filter = &cfg->filter;
+    s.out = cfg->out ? cfg->out : stderr;
+    s.quiet = cfg->summary;
+    if (cfg->summary) {
+        s.stats = stats_create();
+        if (!s.stats) {
+            close(s.sfd);
+            return EXIT_FAILURE;
+        }
+    }
 
     /* The root tracee is already stopped and has had its options set. */
     add_tracee(&s, pid, false);
@@ -584,8 +604,13 @@ int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
     while (s.head)
         remove_tracee(&s, s.head);          /* also folds counters into s */
 
-    fprintf(stderr, "(entries=%lu exits=%lu resyncs=%lu tracees=%d)\n",
-            s.entries, s.exits, s.resyncs, s.ever);
+    if (s.stats) {
+        stats_print(s.out, s.stats);
+        stats_destroy(s.stats);
+    } else {
+        fprintf(s.out, "(entries=%lu exits=%lu resyncs=%lu tracees=%d)\n",
+                s.entries, s.exits, s.resyncs, s.ever);
+    }
 
     close(s.sfd);
     return ret;

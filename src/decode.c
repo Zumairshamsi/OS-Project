@@ -187,7 +187,7 @@ static void put_argv(sb_t *sb, pid_t pid, unsigned long addr)
     sb_puts(sb, "]");
 }
 
-/* envp: just the address and a count, like strace: 0x7ffd... /* 52 vars */
+/* envp: just the address and a count, like strace. */
 static void put_envp(sb_t *sb, pid_t pid, unsigned long addr)
 {
     unsigned long chunk[32];

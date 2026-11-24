@@ -68,9 +68,6 @@ static int parse_args(int argc, char **argv, tracer_config_t *cfg)
     if (optind < argc)
         cfg->cmd_argv = &argv[optind];
 
-    if (cfg.filter_str && filter_parse(cfg.filter_str, &cfg.filter) < 0)
-        return EXIT_FAILURE;
-
     /* Exactly one mode: attach (-p) XOR spawn (command). */
     if (cfg->attach_pid && cfg->cmd_argv) {
         fprintf(stderr, "%s: use either -p PID or a command, not both\n",
@@ -100,6 +97,21 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    if (cfg.filter_str && filter_parse(cfg.filter_str, &cfg.filter) < 0)
+        return EXIT_FAILURE;
+
+    cfg.out = stderr;
+    if (cfg.out_path) {
+        /* "e" = O_CLOEXEC: the traced program must not inherit the log fd. */
+        cfg.out = fopen(cfg.out_path, "we");
+        if (!cfg.out) {
+            fprintf(stderr, "%s: cannot open '%s': %s\n",
+                    argv[0], cfg.out_path, strerror(errno));
+            return EXIT_FAILURE;
+        }
+        setvbuf(cfg.out, NULL, _IOLBF, 0);
+    }
+
     if (cfg.attach_pid) {
         pid = cfg.attach_pid;
         if (tracer_attach(pid) < 0)
@@ -112,5 +124,16 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
     }
 
-    return tracer_run(pid, attached, &cfg);
+    int rc = tracer_run(pid, attached, &cfg);
+
+    if (cfg.out != stderr) {
+        int bad = ferror(cfg.out);
+
+        if (fclose(cfg.out) != 0)
+            bad = 1;
+        if (bad)
+            fprintf(stderr, "%s: error writing to '%s'\n",
+                    argv[0], cfg.out_path);
+    }
+    return rc;
 }

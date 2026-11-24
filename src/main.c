@@ -68,6 +68,9 @@ static int parse_args(int argc, char **argv, tracer_config_t *cfg)
     if (optind < argc)
         cfg->cmd_argv = &argv[optind];
 
+    if (cfg.filter_str && filter_parse(cfg.filter_str, &cfg.filter) < 0)
+        return EXIT_FAILURE;
+
     /* Exactly one mode: attach (-p) XOR spawn (command). */
     if (cfg->attach_pid && cfg->cmd_argv) {
         fprintf(stderr, "%s: use either -p PID or a command, not both\n",

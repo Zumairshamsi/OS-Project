@@ -5,6 +5,14 @@
 #include <sys/types.h>
 #include <stdint.h>
 
+/* Which syscalls to show: a bitmask indexed by syscall number. */
+#define FILTER_MAX_NR 1024
+
+typedef struct {
+    bool     active;                          /* false: trace everything  */
+    uint64_t bits[FILTER_MAX_NR / 64];
+} syscall_filter_t;
+
 
 typedef struct {
     pid_t       attach_pid;   /* -p PID; 0 means spawn mode            */
@@ -12,6 +20,7 @@ typedef struct {
     bool        summary;      /* -c : print statistics table at exit    */
     const char *out_path;     /* -o FILE; NULL means stderr             */
     const char *filter_str;   /* -e trace=...  (text after "trace=")    */
+    syscall_filter_t filter;  /* parsed from filter_str by filter_parse()  */
 } tracer_config_t;
 
 #define ARGSTR_MAX 2048
@@ -83,5 +92,14 @@ bool decode_has_output_buf(long nr);
 
 /* True if the return value is an address (mmap, brk, mremap): print as hex. */
 bool decode_ret_is_pointer(long nr);
+
+/* ---- Syscall filter (src/filter.c) ---- */
+
+/* Parse "read,write,openat" (or "all") into f. Prints an error and returns
+ * -1 on an unknown name or an empty entry. */
+int  filter_parse(const char *list, syscall_filter_t *f);
+
+/* True if syscall nr should be shown. Always true for an inactive filter. */
+bool filter_allows(const syscall_filter_t *f, long nr);
 
 #endif /* TRACER_H */

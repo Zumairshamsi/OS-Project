@@ -35,6 +35,7 @@ typedef struct tracee {
     pid_t          pid;                 /* really a TID                      */
     bool           in_syscall;          /* next syscall stop is an EXIT      */
     bool           have_entry;          /* cur holds a valid entry record    */
+    bool           cur_traced;          /* cur passed the -e filter          */
     bool           awaiting_init_stop;  /* auto-attached child: its first
                                            SIGSTOP has not been seen yet     */
     syscall_rec_t  cur;
@@ -50,6 +51,7 @@ typedef struct {
     pid_t         root;                 /* spawned child / attached PID      */
     int           root_code;            /* exit code to return               */
     int           sfd;                  /* signalfd                          */
+    const syscall_filter_t *filter;     /* from the command line             */
     int64_t       t0_ns;                /* CLOCK_MONOTONIC at tracer start   */
     int           interrupt_sig;        /* SIGINT/SIGTERM seen, else 0       */
     unsigned long entries, exits, resyncs;   /* totals of finished tracees   */
@@ -379,6 +381,7 @@ static void print_syscall(const session_t *s, const tracee_t *t,
 
     fputc('\n', stderr);
 }
+
 static void handle_syscall_stop(session_t *s, tracee_t *t, int64_t stop_ns)
 {
     struct user_regs_struct regs;
@@ -397,14 +400,16 @@ static void handle_syscall_stop(session_t *s, tracee_t *t, int64_t stop_ns)
     if (!t->in_syscall) {
         /* ---- ENTRY ---- */
         fill_entry(&t->cur, &regs);
-        decode_args(t->pid, &t->cur, false);    /* paths, input buffers */
+        t->cur_traced = filter_allows(s->filter, t->cur.nr);
+        if (t->cur_traced)                      /* skip the memory reads  */
+            decode_args(t->pid, &t->cur, false);/* for filtered-out calls */
         t->cur.start_ns = now_ns();             /* after our decoding cost */
         t->cur.dur_ns   = -1;
         t->have_entry = true;
         t->in_syscall = true;
         t->entries++;
 
-        if (never_returns(t->cur.nr))
+        if (t->cur_traced && never_returns(t->cur.nr))
             print_syscall(s, t, &t->cur, true, false);
     } else {
         /* ---- EXIT ---- */
@@ -414,61 +419,17 @@ static void handle_syscall_stop(session_t *s, tracee_t *t, int64_t stop_ns)
             /* Attached mid-syscall: we never saw the arguments. */
             memset(r, 0, sizeof(*r));
             r->nr = (long)regs.orig_rax;
+            t->cur_traced = filter_allows(s->filter, r->nr);
         }
         fill_exit(r, &regs);
         r->dur_ns = t->have_entry ? stop_ns - r->start_ns : -1;
 
-        /* Output buffers (read, readlink...) are only valid now. */
-        if (t->have_entry && decode_has_output_buf(r->nr))
-            decode_args(t->pid, r, true);
-
-        print_syscall(s, t, r, t->have_entry, true);
-
-        t->have_entry = false;
-        t->in_syscall = false;
-        t->exits++;
-    }
-}
-{
-    struct user_regs_struct regs;
-
-    if (get_regs(t->pid, &regs) == -1) {
-        t->in_syscall = !t->in_syscall;     /* keep the toggle moving */
-        return;
-    }
-
-    /* Resync: a genuine ENTRY always has rax == -ENOSYS. */
-    if (!t->in_syscall && (long)regs.rax != -ENOSYS) {
-        t->in_syscall = true;
-        t->resyncs++;
-    }
-
-    if (!t->in_syscall) {
-        /* ---- ENTRY ---- */
-        fill_entry(&t->cur, &regs);
-        decode_args(t->pid, &t->cur, false);    /* paths, input buffers */
-        t->have_entry = true;
-        t->in_syscall = true;
-        t->entries++;
-
-        if (never_returns(t->cur.nr))
-            print_syscall(s, t, &t->cur, true, false);
-    } else {
-        /* ---- EXIT ---- */
-        syscall_rec_t *r = &t->cur;
-
-        if (!t->have_entry) {
-            /* Attached mid-syscall: we never saw the arguments. */
-            memset(r, 0, sizeof(*r));
-            r->nr = (long)regs.orig_rax;
+        if (t->cur_traced) {
+            /* Output buffers (read, readlink...) are only valid now. */
+            if (t->have_entry && decode_has_output_buf(r->nr))
+                decode_args(t->pid, r, true);
+            print_syscall(s, t, r, t->have_entry, true);
         }
-        fill_exit(r, &regs);
-
-        /* Output buffers (read, readlink...) are only valid now. */
-        if (t->have_entry && decode_has_output_buf(r->nr))
-            decode_args(t->pid, r, true);
-
-        print_syscall(s, t, r, t->have_entry, true);
 
         t->have_entry = false;
         t->in_syscall = false;
@@ -554,7 +515,6 @@ int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
     session_t s = { .root = pid, .root_code = EXIT_FAILURE, .sfd = -1 };
     int ret;
 
-    (void)cfg;                  /* used from Step 10 onwards */
 
     syscalls_init();
     if (setup_signals(&s) == -1)
@@ -563,6 +523,7 @@ int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
     if (setup_signals(&s) == -1)
         return EXIT_FAILURE;
     s.t0_ns = now_ns();
+    s.filter = &cfg->filter;
 
     /* The root tracee is already stopped and has had its options set. */
     add_tracee(&s, pid, false);

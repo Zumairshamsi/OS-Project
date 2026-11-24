@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <sys/types.h>
+#include <stdint.h>
 
 
 typedef struct {
@@ -23,6 +24,8 @@ typedef struct {
     long          ret;         /* rax at exit                            */
     bool          failed;      /* ret in [-4095, -1]                     */
     int           err;         /* errno value when failed, else 0        */
+    int64_t       start_ns;    /* CLOCK_MONOTONIC when the call began    */
+    int64_t       dur_ns;      /* time inside the kernel; -1 = unknown   */
     char          argstr[ARGSTR_MAX];  /* rendered arguments, no parens  */
 } syscall_rec_t;
 

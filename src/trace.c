@@ -13,6 +13,7 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "tracer.h"
 
@@ -49,6 +50,7 @@ typedef struct {
     pid_t         root;                 /* spawned child / attached PID      */
     int           root_code;            /* exit code to return               */
     int           sfd;                  /* signalfd                          */
+    int64_t       t0_ns;                /* CLOCK_MONOTONIC at tracer start   */
     int           interrupt_sig;        /* SIGINT/SIGTERM seen, else 0       */
     unsigned long entries, exits, resyncs;   /* totals of finished tracees   */
 } session_t;
@@ -93,11 +95,41 @@ static void remove_tracee(session_t *s, tracee_t *t)
     free(t);
 }
 
-/* "[pid N] " only once more than one process/thread has existed. */
-static void prefix(const session_t *s, const tracee_t *t)
+/* ------------------------------------------------------------------ */
+/* Clock and line prefixes                                             */
+/* ------------------------------------------------------------------ */
+
+static int64_t now_ns(void)
 {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* "[  1.234567] " : seconds.microseconds since the tracer started. */
+static void put_stamp(const session_t *s, int64_t ns)
+{
+    int64_t rel = ns - s->t0_ns;
+
+    if (rel < 0)
+        rel = 0;
+    fprintf(stderr, "[%3lld.%06lld] ",
+            (long long)(rel / 1000000000LL),
+            (long long)((rel % 1000000000LL) / 1000));
+}
+
+/* Timestamp, then "[pid N] " once more than one process/thread existed. */
+static void prefix_at(const session_t *s, const tracee_t *t, int64_t ns)
+{
+    put_stamp(s, ns);
     if (s->ever > 1)
         fprintf(stderr, "[pid %d] ", t->pid);
+}
+
+static void prefix(const session_t *s, const tracee_t *t)
+{
+    prefix_at(s, t, now_ns());
 }
 
 /* ------------------------------------------------------------------ */
@@ -126,7 +158,7 @@ static const char *signame(int sig, char *buf, size_t n)
 static bool is_stop_signal(int sig)
 {
     return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN ||
-           sig == SIGTTOU;
+           sig == SIGTTOU;prefix
 }
 
 /* Print a signal-delivery-stop in strace style. */
@@ -308,14 +340,15 @@ static bool never_returns(long nr)
 /* ------------------------------------------------------------------ */
 /* Syscall output                                                      */
 /* ------------------------------------------------------------------ */
-
 static void print_syscall(const session_t *s, const tracee_t *t,
                           const syscall_rec_t *r, bool have_args,
                           bool returned)
 {
     const char *name = syscall_name(r->nr);
 
-    prefix(s, t);
+    /* Stamp = when the call began (unknown if we attached mid-call). */
+    prefix_at(s, t, have_args ? r->start_ns : now_ns());
+
     if (name)
         fputs(name, stderr);
     else
@@ -326,21 +359,76 @@ static void print_syscall(const session_t *s, const tracee_t *t,
     fputc(')', stderr);
 
     if (!returned) {
-        fputs(" = ?\n", stderr);
+        fputs(" = ?", stderr);
     } else if (r->failed) {
         const char *en = errno_name(r->err);
         if (en)
-            fprintf(stderr, " = -1 %s (%s)\n", en, strerror(r->err));
+            fprintf(stderr, " = -1 %s (%s)", en, strerror(r->err));
         else
-            fprintf(stderr, " = -1 errno %d (%s)\n", r->err, strerror(r->err));
+            fprintf(stderr, " = -1 errno %d (%s)", r->err, strerror(r->err));
     } else if (decode_ret_is_pointer(r->nr)) {
-        fprintf(stderr, " = 0x%lx\n", (unsigned long)r->ret);
+        fprintf(stderr, " = 0x%lx", (unsigned long)r->ret);
     } else {
-        fprintf(stderr, " = %ld\n", r->ret);
+        fprintf(stderr, " = %ld", r->ret);
+    }
+
+    if (returned && r->dur_ns >= 0)
+        fprintf(stderr, " <%lld.%06lld>",
+                (long long)(r->dur_ns / 1000000000LL),
+                (long long)((r->dur_ns % 1000000000LL) / 1000));
+
+    fputc('\n', stderr);
+}
+static void handle_syscall_stop(session_t *s, tracee_t *t, int64_t stop_ns)
+{
+    struct user_regs_struct regs;
+
+    if (get_regs(t->pid, &regs) == -1) {
+        t->in_syscall = !t->in_syscall;     /* keep the toggle moving */
+        return;
+    }
+
+    /* Resync: a genuine ENTRY always has rax == -ENOSYS. */
+    if (!t->in_syscall && (long)regs.rax != -ENOSYS) {
+        t->in_syscall = true;
+        t->resyncs++;
+    }
+
+    if (!t->in_syscall) {
+        /* ---- ENTRY ---- */
+        fill_entry(&t->cur, &regs);
+        decode_args(t->pid, &t->cur, false);    /* paths, input buffers */
+        t->cur.start_ns = now_ns();             /* after our decoding cost */
+        t->cur.dur_ns   = -1;
+        t->have_entry = true;
+        t->in_syscall = true;
+        t->entries++;
+
+        if (never_returns(t->cur.nr))
+            print_syscall(s, t, &t->cur, true, false);
+    } else {
+        /* ---- EXIT ---- */
+        syscall_rec_t *r = &t->cur;
+
+        if (!t->have_entry) {
+            /* Attached mid-syscall: we never saw the arguments. */
+            memset(r, 0, sizeof(*r));
+            r->nr = (long)regs.orig_rax;
+        }
+        fill_exit(r, &regs);
+        r->dur_ns = t->have_entry ? stop_ns - r->start_ns : -1;
+
+        /* Output buffers (read, readlink...) are only valid now. */
+        if (t->have_entry && decode_has_output_buf(r->nr))
+            decode_args(t->pid, r, true);
+
+        print_syscall(s, t, r, t->have_entry, true);
+
+        t->have_entry = false;
+        t->in_syscall = false;
+        t->exits++;
     }
 }
-
-static void handle_syscall_stop(session_t *s, tracee_t *t)
 {
     struct user_regs_struct regs;
 
@@ -472,6 +560,10 @@ int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
     if (setup_signals(&s) == -1)
         return EXIT_FAILURE;
 
+    if (setup_signals(&s) == -1)
+        return EXIT_FAILURE;
+    s.t0_ns = now_ns();
+
     /* The root tracee is already stopped and has had its options set. */
     add_tracee(&s, pid, false);
     resume(s.head, 0);
@@ -509,12 +601,13 @@ int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
         if (!WIFSTOPPED(status))
             continue;
 
+        int64_t stop_ns = now_ns();     /* right after waitpid returned */
         int stopsig = WSTOPSIG(status);
         int event   = status >> 16;     /* PTRACE_EVENT_* or 0 */
         int deliver = 0;
 
         if (stopsig == SYSCALL_STOP) {
-            handle_syscall_stop(&s, t);
+            handle_syscall_stop(&s, t, stop_ns);
         } else if (stopsig == SIGTRAP && event) {
             handle_event(&s, t, event);
         } else if (t->awaiting_init_stop && stopsig == SIGSTOP) {

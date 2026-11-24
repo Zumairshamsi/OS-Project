@@ -7,12 +7,17 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 #include "tracer.h"
 
 int tracer_set_options(pid_t pid, bool exit_kill)
 {
-    long opts = PTRACE_O_TRACESYSGOOD;      /* syscall stops = SIGTRAP|0x80 */
+    long opts = PTRACE_O_TRACESYSGOOD       /* syscall stops = SIGTRAP|0x80 */
+              | PTRACE_O_TRACEEXEC          /* distinct stop on execve      */
+              | PTRACE_O_TRACEFORK          /* follow fork()                */
+              | PTRACE_O_TRACEVFORK         /* follow vfork()               */
+              | PTRACE_O_TRACECLONE;        /* follow clone() / threads     */
 
     if (exit_kill)
         opts |= PTRACE_O_EXITKILL;          /* tracee dies if we die        */
@@ -115,8 +120,8 @@ int tracer_detach(pid_t pid)
 {
     int status;
 
-    if (kill(pid, SIGSTOP) == -1)
-        return (errno == ESRCH) ? 0 : -1;
+    if (syscall(SYS_tkill, pid, SIGSTOP) == -1)  /* this thread only */
+        return (errno == ESRCH) ? 0 : -1;        /* already gone */
 
     for (;;) {
         if (waitpid(pid, &status, __WALL) == -1)

@@ -99,7 +99,6 @@ int main(int argc, char **argv)
 
     if (cfg.attach_pid) {
         pid = cfg.attach_pid;
-        tracer_install_stop_handlers();
         if (tracer_attach(pid) < 0)
             return EXIT_FAILURE;
         attached = true;

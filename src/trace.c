@@ -1,5 +1,5 @@
-#define _GNU_SOURCE
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -7,10 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "tracer.h"
 
@@ -21,42 +23,247 @@
 #define SYSCALL_STOP (SIGTRAP | 0x80)   /* what PTRACE_O_TRACESYSGOOD reports */
 #define MAX_ERRNO    4095               /* kernel: IS_ERR_VALUE range         */
 
-/* Per-tracee state. One tracee for now; Step 8 extends this to children. */
-typedef struct {
-    pid_t         pid;
-    bool          in_syscall;   /* false: next syscall stop should be ENTRY
-                                   true : next syscall stop should be EXIT  */
-    bool          have_entry;   /* cur holds a valid entry record           */
-    syscall_rec_t cur;          /* syscall currently in progress            */
-    unsigned long entries;
-    unsigned long exits;
-    unsigned long resyncs;      /* toggle corrections via the -ENOSYS check */
+/* ------------------------------------------------------------------ */
+/* Data structures                                                     */
+/* ------------------------------------------------------------------ */
+
+/* One traced process or thread. Heap-allocated so pointers stay valid
+ * while new tracees are added during event handling. */
+typedef struct tracee {
+    struct tracee *next;
+    pid_t          pid;                 /* really a TID                      */
+    bool           in_syscall;          /* next syscall stop is an EXIT      */
+    bool           have_entry;          /* cur holds a valid entry record    */
+    bool           awaiting_init_stop;  /* auto-attached child: its first
+                                           SIGSTOP has not been seen yet     */
+    syscall_rec_t  cur;
+    unsigned long  entries;
+    unsigned long  exits;
+    unsigned long  resyncs;
 } tracee_t;
 
-/* ---------- Ctrl+C handling (attach mode) ---------- */
+typedef struct {
+    tracee_t     *head;
+    int           nlive;                /* tracees currently in the list     */
+    int           ever;                 /* tracees ever created              */
+    pid_t         root;                 /* spawned child / attached PID      */
+    int           root_code;            /* exit code to return               */
+    int           sfd;                  /* signalfd                          */
+    int           interrupt_sig;        /* SIGINT/SIGTERM seen, else 0       */
+    unsigned long entries, exits, resyncs;   /* totals of finished tracees   */
+} session_t;
 
-static volatile sig_atomic_t g_stop = 0;
-
-static void on_stop_signal(int sig)
+static tracee_t *find_tracee(const session_t *s, pid_t pid)
 {
-    (void)sig;
-    g_stop = 1;
+    for (tracee_t *t = s->head; t; t = t->next)
+        if (t->pid == pid)
+            return t;
+    return NULL;
 }
 
-void tracer_install_stop_handlers(void)
+static tracee_t *add_tracee(session_t *s, pid_t pid, bool awaiting)
+{
+    tracee_t *t = calloc(1, sizeof *t);
+
+    if (!t) {
+        perror("calloc");
+        exit(EXIT_FAILURE);             /* EXITKILL/kernel clean up for us */
+    }
+    t->pid = pid;
+    t->awaiting_init_stop = awaiting;
+    t->next = s->head;
+    s->head = t;
+    s->nlive++;
+    s->ever++;
+    return t;
+}
+
+static void remove_tracee(session_t *s, tracee_t *t)
+{
+    for (tracee_t **pp = &s->head; *pp; pp = &(*pp)->next) {
+        if (*pp == t) {
+            *pp = t->next;
+            break;
+        }
+    }
+    s->entries += t->entries;
+    s->exits   += t->exits;
+    s->resyncs += t->resyncs;
+    s->nlive--;
+    free(t);
+}
+
+/* "[pid N] " only once more than one process/thread has existed. */
+static void prefix(const session_t *s, const tracee_t *t)
+{
+    if (s->ever > 1)
+        fprintf(stderr, "[pid %d] ", t->pid);
+}
+
+/* ------------------------------------------------------------------ */
+/* Signal names and reporting                                          */
+/* ------------------------------------------------------------------ */
+
+static const char *signame(int sig, char *buf, size_t n)
+{
+#define SN(x) [x] = #x
+    static const char *const names[32] = {
+        SN(SIGHUP), SN(SIGINT), SN(SIGQUIT), SN(SIGILL), SN(SIGTRAP),
+        SN(SIGABRT), SN(SIGBUS), SN(SIGFPE), SN(SIGKILL), SN(SIGUSR1),
+        SN(SIGSEGV), SN(SIGUSR2), SN(SIGPIPE), SN(SIGALRM), SN(SIGTERM),
+        SN(SIGSTKFLT), SN(SIGCHLD), SN(SIGCONT), SN(SIGSTOP), SN(SIGTSTP),
+        SN(SIGTTIN), SN(SIGTTOU), SN(SIGURG), SN(SIGXCPU), SN(SIGXFSZ),
+        SN(SIGVTALRM), SN(SIGPROF), SN(SIGWINCH), SN(SIGIO), SN(SIGPWR),
+        SN(SIGSYS),
+    };
+#undef SN
+    if (sig > 0 && sig < 32 && names[sig])
+        return names[sig];
+    snprintf(buf, n, "SIG%d", sig);
+    return buf;
+}
+
+static bool is_stop_signal(int sig)
+{
+    return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN ||
+           sig == SIGTTOU;
+}
+
+/* Print a signal-delivery-stop in strace style. */
+static void report_signal(const session_t *s, const tracee_t *t, int sig)
+{
+    siginfo_t si;
+    char nb[24];
+    const char *nm = signame(sig, nb, sizeof nb);
+
+    prefix(s, t);
+
+    if (ptrace(PTRACE_GETSIGINFO, t->pid, 0, &si) == -1) {
+        fprintf(stderr, "--- %s ---\n", nm);
+        return;
+    }
+
+    switch (sig) {
+    case SIGSEGV:
+    case SIGBUS:
+    case SIGILL:
+    case SIGFPE:
+        if (sig == SIGSEGV && si.si_code == SEGV_MAPERR)
+            fprintf(stderr, "--- %s {si_code=SEGV_MAPERR, si_addr=%p} ---\n",
+                    nm, si.si_addr);
+        else if (sig == SIGSEGV && si.si_code == SEGV_ACCERR)
+            fprintf(stderr, "--- %s {si_code=SEGV_ACCERR, si_addr=%p} ---\n",
+                    nm, si.si_addr);
+        else
+            fprintf(stderr, "--- %s {si_code=%d, si_addr=%p} ---\n",
+                    nm, si.si_code, si.si_addr);
+        break;
+    case SIGCHLD:
+        fprintf(stderr, "--- %s {si_pid=%d, si_status=%d} ---\n",
+                nm, (int)si.si_pid, si.si_status);
+        break;
+    default:
+        if (si.si_code <= 0)            /* kill(), sigqueue(), tkill()... */
+            fprintf(stderr, "--- %s {si_pid=%d, si_uid=%u} ---\n",
+                    nm, (int)si.si_pid, (unsigned)si.si_uid);
+        else
+            fprintf(stderr, "--- %s ---\n", nm);
+        break;
+    }
+}
+
+static void report_exit(const session_t *s, const tracee_t *t, int status)
+{
+    prefix(s, t);
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "+++ exited with %d +++\n", WEXITSTATUS(status));
+    } else {
+        char nb[24];
+
+        fprintf(stderr, "+++ killed by %s%s +++\n",
+                signame(WTERMSIG(status), nb, sizeof nb),
+                WCOREDUMP(status) ? " (core dumped)" : "");
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Race-free Ctrl+C: block the signals and read them from a signalfd   */
+/* ------------------------------------------------------------------ */
+
+static int setup_signals(session_t *s)
 {
     struct sigaction sa;
+    sigset_t mask;
 
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_stop_signal;
+    /* An inherited SIG_IGN for SIGCHLD would stop the kernel from
+     * generating it, and we rely on it to wake up. */
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;            /* no SA_RESTART: waitpid must return EINTR */
+    sigaction(SIGCHLD, &sa, NULL);
 
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+        perror("sigprocmask");
+        return -1;
+    }
+    s->sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (s->sfd == -1) {
+        perror("signalfd");
+        return -1;
+    }
+    return 0;
 }
 
-/* ---------- register access ---------- */
+/* Consume everything queued on the signalfd; remember SIGINT/SIGTERM. */
+static void drain_signals(session_t *s)
+{
+    struct signalfd_siginfo si;
+
+    while (read(s->sfd, &si, sizeof si) == (ssize_t)sizeof si)
+        if ((si.ssi_signo == SIGINT || si.ssi_signo == SIGTERM) &&
+            !s->interrupt_sig)
+            s->interrupt_sig = (int)si.ssi_signo;
+}
+
+/* Wait for any tracee to change state.
+ * Returns 1 with *pid/*status filled, 0 if the user interrupted us,
+ * -1 on error (errno set; ECHILD means no tracees are left). */
+static int wait_any(session_t *s, int *status, pid_t *pid)
+{
+    for (;;) {
+        pid_t r;
+
+        drain_signals(s);               /* checked on EVERY iteration */
+        if (s->interrupt_sig)
+            return 0;
+
+        r = waitpid(-1, status, __WALL | WNOHANG);
+        if (r > 0) {
+            *pid = r;
+            return 1;
+        }
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        /* Nothing ready. Any new state change queues SIGCHLD on the
+         * signalfd, so this wakes up immediately; the timeout is only a
+         * defensive upper bound. */
+        struct pollfd p = { .fd = s->sfd, .events = POLLIN };
+        (void)poll(&p, 1, 250);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Registers                                                           */
+/* ------------------------------------------------------------------ */
 
 static int get_regs(pid_t pid, struct user_regs_struct *regs)
 {
@@ -98,12 +305,17 @@ static bool never_returns(long nr)
     return nr == SYS_exit_group || nr == SYS_exit;
 }
 
-/* ---------- output (raw numbers for now; names in Step 6) ---------- */
+/* ------------------------------------------------------------------ */
+/* Syscall output                                                      */
+/* ------------------------------------------------------------------ */
 
-static void print_syscall(const syscall_rec_t *r, bool have_args, bool returned)
+static void print_syscall(const session_t *s, const tracee_t *t,
+                          const syscall_rec_t *r, bool have_args,
+                          bool returned)
 {
     const char *name = syscall_name(r->nr);
 
+    prefix(s, t);
     if (name)
         fputs(name, stderr);
     else
@@ -128,9 +340,7 @@ static void print_syscall(const syscall_rec_t *r, bool have_args, bool returned)
     }
 }
 
-/* ---------- one syscall stop ---------- */
-
-static void handle_syscall_stop(tracee_t *t)
+static void handle_syscall_stop(session_t *s, tracee_t *t)
 {
     struct user_regs_struct regs;
 
@@ -139,8 +349,7 @@ static void handle_syscall_stop(tracee_t *t)
         return;
     }
 
-    /* Resync: a genuine ENTRY always has rax == -ENOSYS. If we expected an
-     * entry but rax says otherwise, this is really an EXIT stop. */
+    /* Resync: a genuine ENTRY always has rax == -ENOSYS. */
     if (!t->in_syscall && (long)regs.rax != -ENOSYS) {
         t->in_syscall = true;
         t->resyncs++;
@@ -155,7 +364,7 @@ static void handle_syscall_stop(tracee_t *t)
         t->entries++;
 
         if (never_returns(t->cur.nr))
-            print_syscall(&t->cur, true, false);
+            print_syscall(s, t, &t->cur, true, false);
     } else {
         /* ---- EXIT ---- */
         syscall_rec_t *r = &t->cur;
@@ -171,7 +380,7 @@ static void handle_syscall_stop(tracee_t *t)
         if (t->have_entry && decode_has_output_buf(r->nr))
             decode_args(t->pid, r, true);
 
-        print_syscall(r, t->have_entry, true);
+        print_syscall(s, t, r, t->have_entry, true);
 
         t->have_entry = false;
         t->in_syscall = false;
@@ -179,76 +388,151 @@ static void handle_syscall_stop(tracee_t *t)
     }
 }
 
-/* ---------- main loop ---------- */
+/* ------------------------------------------------------------------ */
+/* Event stops and signal stops                                        */
+/* ------------------------------------------------------------------ */
 
-static void print_totals(const tracee_t *t)
+static void handle_event(session_t *s, tracee_t *t, int event)
 {
-    fprintf(stderr, "(entries=%lu exits=%lu resyncs=%lu)\n",
-            t->entries, t->exits, t->resyncs);
+    unsigned long msg;
+
+    switch (event) {
+    case PTRACE_EVENT_FORK:
+    case PTRACE_EVENT_VFORK:
+    case PTRACE_EVENT_CLONE:
+        /* The new child is already traced by the kernel. Register it unless
+         * its initial SIGSTOP was reported (and the child created) first. */
+        if (ptrace(PTRACE_GETEVENTMSG, t->pid, 0, &msg) == -1) {
+            if (errno != ESRCH)
+                perror("ptrace(PTRACE_GETEVENTMSG)");
+            return;
+        }
+        if (!find_tracee(s, (pid_t)msg))
+            add_tracee(s, (pid_t)msg, true);
+        break;
+
+    case PTRACE_EVENT_EXEC:
+        /* Nothing to do: the execve entry was already decoded, and its exit
+         * stop follows. The old address space is gone, which is why paths
+         * are read at entry. */
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* A non-syscall, non-event stop. Returns the signal to deliver on resume. */
+static int handle_signal_stop(session_t *s, tracee_t *t, int sig)
+{
+    siginfo_t si;
+
+    /* Signal-delivery-stop has siginfo; a group-stop does not (EINVAL).
+     * Without PTRACE_SEIZE we cannot keep a group-stopped tracee stopped
+     * (no PTRACE_LISTEN), so we report it and let it run. */
+    if (is_stop_signal(sig) &&
+        ptrace(PTRACE_GETSIGINFO, t->pid, 0, &si) == -1 && errno == EINVAL) {
+        char nb[24];
+
+        prefix(s, t);
+        fprintf(stderr, "--- stopped by %s ---\n", signame(sig, nb, sizeof nb));
+        return 0;
+    }
+
+    report_signal(s, t, sig);
+    return sig;                         /* deliver it to the program */
+}
+
+static void resume(const tracee_t *t, int sig)
+{
+    if (ptrace(PTRACE_SYSCALL, t->pid, 0, (void *)(intptr_t)sig) == -1 &&
+        errno != ESRCH)                 /* ESRCH: killed; waitpid reports it */
+        perror("ptrace(PTRACE_SYSCALL)");
+}
+
+/* ------------------------------------------------------------------ */
+/* Main loop                                                           */
+/* ------------------------------------------------------------------ */
+
+static void detach_all(session_t *s)
+{
+    for (tracee_t *t = s->head; t; t = t->next)
+        if (tracer_detach(t->pid) == 0)
+            fprintf(stderr, "+++ detached from pid %d +++\n", t->pid);
 }
 
 int tracer_run(pid_t pid, bool attached, const tracer_config_t *cfg)
 {
-    tracee_t t = { .pid = pid };
-    int  status;
-    int  sig = 0;               /* signal to deliver on the next resume */
-    bool resume = true;
+    session_t s = { .root = pid, .root_code = EXIT_FAILURE, .sfd = -1 };
+    int ret;
 
-    (void)cfg;                  /* used from Step 7 onwards */
+    (void)cfg;                  /* used from Step 10 onwards */
+
     syscalls_init();
+    if (setup_signals(&s) == -1)
+        return EXIT_FAILURE;
 
-    for (;;) {
-        if (resume &&
-            ptrace(PTRACE_SYSCALL, t.pid, 0, (void *)(intptr_t)sig) == -1) {
-            if (errno == ESRCH) {
-                resume = false;     /* tracee vanished: collect its status */
-            } else {
-                perror("ptrace(PTRACE_SYSCALL)");
-                return EXIT_FAILURE;
-            }
+    /* The root tracee is already stopped and has had its options set. */
+    add_tracee(&s, pid, false);
+    resume(s.head, 0);
+
+    while (s.nlive > 0) {
+        int     status;
+        pid_t   wpid;
+        tracee_t *t;
+        int     w = wait_any(&s, &status, &wpid);
+
+        if (w == 0) {                               /* Ctrl+C / SIGTERM */
+            detach_all(&s);
+            s.root_code = attached ? EXIT_SUCCESS : 128 + s.interrupt_sig;
+            break;
         }
-        resume = true;
-        sig = 0;
-
-        if (waitpid(t.pid, &status, __WALL) == -1) {
-            if (errno == EINTR) {
-                if (attached && g_stop) {
-                    if (tracer_detach(t.pid) == 0)
-                        fprintf(stderr, "+++ detached from pid %d +++\n",
-                                t.pid);
-                    return EXIT_SUCCESS;
-                }
-                resume = false;     /* tracee still running: wait again */
-                continue;
-            }
-            perror("waitpid");
-            return EXIT_FAILURE;
+        if (w < 0) {
+            if (errno != ECHILD)
+                perror("waitpid");
+            break;
         }
 
-        if (WIFEXITED(status)) {
-            fprintf(stderr, "+++ exited with %d +++\n", WEXITSTATUS(status));
-            print_totals(&t);
-            return WEXITSTATUS(status);
-        }
-        if (WIFSIGNALED(status)) {
-            fprintf(stderr, "+++ killed by signal %d +++\n", WTERMSIG(status));
-            print_totals(&t);
-            return 128 + WTERMSIG(status);
+        /* A child can be reported before its parent's clone event. */
+        t = find_tracee(&s, wpid);
+        if (!t)
+            t = add_tracee(&s, wpid, true);
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            report_exit(&s, t, status);
+            if (t->pid == s.root)
+                s.root_code = WIFEXITED(status) ? WEXITSTATUS(status)
+                                                : 128 + WTERMSIG(status);
+            remove_tracee(&s, t);
+            continue;
         }
         if (!WIFSTOPPED(status))
             continue;
 
         int stopsig = WSTOPSIG(status);
+        int event   = status >> 16;     /* PTRACE_EVENT_* or 0 */
+        int deliver = 0;
 
         if (stopsig == SYSCALL_STOP) {
-            handle_syscall_stop(&t);
-        } else if (stopsig == SIGTRAP) {
-            /* Post-execve trap: ours, do not deliver. (Step 8 replaces
-             * this with PTRACE_O_TRACEEXEC.) */
-            sig = 0;
+            handle_syscall_stop(&s, t);
+        } else if (stopsig == SIGTRAP && event) {
+            handle_event(&s, t, event);
+        } else if (t->awaiting_init_stop && stopsig == SIGSTOP) {
+            t->awaiting_init_stop = false;  /* auto-attach start: swallow */
         } else {
-            /* A real signal destined for the tracee: pass it through. */
-            sig = stopsig;
+            deliver = handle_signal_stop(&s, t, stopsig);
         }
+        resume(t, deliver);
     }
+
+    ret = s.root_code;
+
+    while (s.head)
+        remove_tracee(&s, s.head);          /* also folds counters into s */
+
+    fprintf(stderr, "(entries=%lu exits=%lu resyncs=%lu tracees=%d)\n",
+            s.entries, s.exits, s.resyncs, s.ever);
+
+    close(s.sfd);
+    return ret;
 }
